@@ -2,15 +2,24 @@
 
 EXTENDS Sequences, Integers, TLC, FiniteSets
 
+\* Number of concurrent key fetchers.
+num_processes == 3
+\* Number of keys to fetch, total.
+num_keys == 2
+
+ASSUME num_processes >= num_keys
+
 (* --fair algorithm fle_key_cache
 
-variables lock = [r |-> FALSE, g |-> FALSE, b |-> 0],
-          key_cache = [key0 |-> "null"],
+variables \* A readers-writer lock has three internal variables, see below.
+          lock = [r |-> FALSE, g |-> FALSE, b |-> 0],
+          \* Each key starts "null", becomes "pending" or "fetched".
+          key_cache = [key \in 1..num_keys |-> "null"],
           \* For each key, process "0" means no process fetched this key.
-          which_process_fetched_key = [key0 |-> 0]
+          which_process_fetched_key = [key \in 1..num_keys |-> 0]
           
 define
-    all_fetched == \A key \in DOMAIN key_cache: key \notin {"null", "pending"}
+    all_fetched == \A key \in DOMAIN key_cache: key_cache[key] \notin {"null", "pending"}
     each_key_fetched_by_one_process ==
         \A key \in DOMAIN which_process_fetched_key: which_process_fetched_key[key] /= 0
 end define;
@@ -90,21 +99,25 @@ Fetch a key from Amazon's KMS service and put it in a shared cache.
 
 ***************************************************************************)
 
-process get_key \in 1..2
-    variables got_key = FALSE;
+process get_key \in 1..num_processes
+    \* Each key is fetched by one or more processes. self and key_to_fetch are
+    \* both 1-indexed.
+    variables key_to_fetch = ((self - 1) % num_keys) + 1,
+              got_key = FALSE;
 begin
     GET_KEY:
         call begin_read();
     GET_KEY_READ_CACHE0:
-        if key_cache.key0 = "pending" then
+        if key_cache[key_to_fetch] = "pending" then
             \* Another thread is fetching this key, await its success/failure.
             call end_read();
     GET_KEY_READ_CACHE1:        
-            await key_cache.key0 /= "pending";
+            await key_cache[key_to_fetch] /= "pending";
             \* Try again.
             goto GET_KEY;                    
-        elsif key_cache.key0 /= "null" then
-            \* Key is cached. In real life, return the key to the caller.
+        elsif key_cache[key_to_fetch] /= "null" then
+            \* Key is cached.
+            call end_read();
             goto Done;
         end if;
     GET_KEY_WRITE_PENDING0:
@@ -113,16 +126,16 @@ begin
         call begin_write();
     GET_KEY_WRITE_PENDING2:
         \* We dropped the lock in end_read() above, so check again.
-        if key_cache.key0 /= "null" then
+        if key_cache[key_to_fetch] /= "null" then
             call end_write();
             goto GET_KEY;
         end if;
     GET_KEY_WRITE_PENDING3:
-        key_cache.key0 := "pending";
+        key_cache[key_to_fetch] := "pending";
         \* which_process_fetched_key is not part of the real algorithm, it's for
         \* checking the algorithm's correctness.
-        assert which_process_fetched_key.key0 = 0;
-        which_process_fetched_key.key0 := self;
+        assert which_process_fetched_key[key_to_fetch] = 0;
+        which_process_fetched_key[key_to_fetch] := self;
     GET_KEY_WRITE_KEY0:
         \* Unlock while we fetch the key.
         call end_write();
@@ -130,18 +143,19 @@ begin
         call begin_write();
     GET_KEY_START_FETCHING:        
         \* Still "pending", no other process can change it.
-        assert key_cache.key0 = "pending";
+        assert key_cache[key_to_fetch] = "pending";
         either 
     GET_KEY_SUCCEEDED:
-            key_cache.key0 := "key_material";        
+            \* Write some actual decrypted key material here.
+            key_cache[key_to_fetch] := "fetched";
             got_key := TRUE;
         or
     GET_KEY_FAILED:
             \* Failed to fetch the key.
-            key_cache.key0 := "null";
+            key_cache[key_to_fetch] := "null";
             got_key := FALSE;
-            assert which_process_fetched_key.key0 = self;
-            which_process_fetched_key.key0 := 0;
+            assert which_process_fetched_key[key_to_fetch] = self;
+            which_process_fetched_key[key_to_fetch] := 0;
         end either;
     GET_KEY_WRITE_KEY3:
         call end_write();
@@ -149,6 +163,7 @@ begin
         if ~got_key then
             goto GET_KEY;
         end if;
+    \* In real life, return the key to the caller.
 end process
 
 end algorithm; *)
@@ -157,22 +172,24 @@ end algorithm; *)
 VARIABLES lock, key_cache, which_process_fetched_key, pc, stack
 
 (* define statement *)
-all_fetched == \A key \in DOMAIN key_cache: key \notin {"null", "pending"}
+all_fetched == \A key \in DOMAIN key_cache: key_cache[key] \notin {"null", "pending"}
 each_key_fetched_by_one_process ==
     \A key \in DOMAIN which_process_fetched_key: which_process_fetched_key[key] /= 0
 
-VARIABLE got_key
+VARIABLES key_to_fetch, got_key
 
-vars == << lock, key_cache, which_process_fetched_key, pc, stack, got_key >>
+vars == << lock, key_cache, which_process_fetched_key, pc, stack, 
+           key_to_fetch, got_key >>
 
-ProcSet == (1..2)
+ProcSet == (1..num_processes)
 
 Init == (* Global variables *)
         /\ lock = [r |-> FALSE, g |-> FALSE, b |-> 0]
-        /\ key_cache = [key0 |-> "null"]
-        /\ which_process_fetched_key = [key0 |-> 0]
+        /\ key_cache = [key \in 1..num_keys |-> "null"]
+        /\ which_process_fetched_key = [key \in 1..num_keys |-> 0]
         (* Process get_key *)
-        /\ got_key = [self \in 1..2 |-> FALSE]
+        /\ key_to_fetch = [self \in 1..num_processes |-> ((self - 1) % num_keys) + 1]
+        /\ got_key = [self \in 1..num_processes |-> FALSE]
         /\ stack = [self \in ProcSet |-> << >>]
         /\ pc = [self \in ProcSet |-> "GET_KEY"]
 
@@ -181,14 +198,14 @@ BEGIN_READ(self) == /\ pc[self] = "BEGIN_READ"
                     /\ lock' = [lock EXCEPT !.r = TRUE]
                     /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ_INCREMENT_B"]
                     /\ UNCHANGED << key_cache, which_process_fetched_key, 
-                                    stack, got_key >>
+                                    stack, key_to_fetch, got_key >>
 
 BEGIN_READ_INCREMENT_B(self) == /\ pc[self] = "BEGIN_READ_INCREMENT_B"
                                 /\ lock' = [lock EXCEPT !.b = lock.b + 1]
                                 /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ_CHECK_B"]
                                 /\ UNCHANGED << key_cache, 
                                                 which_process_fetched_key, 
-                                                stack, got_key >>
+                                                stack, key_to_fetch, got_key >>
 
 BEGIN_READ_CHECK_B(self) == /\ pc[self] = "BEGIN_READ_CHECK_B"
                             /\ IF lock.b = 1
@@ -196,7 +213,7 @@ BEGIN_READ_CHECK_B(self) == /\ pc[self] = "BEGIN_READ_CHECK_B"
                                   ELSE /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ_UNLOCK_R"]
                             /\ UNCHANGED << lock, key_cache, 
                                             which_process_fetched_key, stack, 
-                                            got_key >>
+                                            key_to_fetch, got_key >>
 
 BEGIN_READ_AWAIT_G(self) == /\ pc[self] = "BEGIN_READ_AWAIT_G"
                             /\ ~lock.g
@@ -204,20 +221,21 @@ BEGIN_READ_AWAIT_G(self) == /\ pc[self] = "BEGIN_READ_AWAIT_G"
                             /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ_UNLOCK_R"]
                             /\ UNCHANGED << key_cache, 
                                             which_process_fetched_key, stack, 
-                                            got_key >>
+                                            key_to_fetch, got_key >>
 
 BEGIN_READ_UNLOCK_R(self) == /\ pc[self] = "BEGIN_READ_UNLOCK_R"
                              /\ lock' = [lock EXCEPT !.r = FALSE]
                              /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ_DONE"]
                              /\ UNCHANGED << key_cache, 
                                              which_process_fetched_key, stack, 
-                                             got_key >>
+                                             key_to_fetch, got_key >>
 
 BEGIN_READ_DONE(self) == /\ pc[self] = "BEGIN_READ_DONE"
                          /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                          /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                          /\ UNCHANGED << lock, key_cache, 
-                                         which_process_fetched_key, got_key >>
+                                         which_process_fetched_key, 
+                                         key_to_fetch, got_key >>
 
 begin_read(self) == BEGIN_READ(self) \/ BEGIN_READ_INCREMENT_B(self)
                        \/ BEGIN_READ_CHECK_B(self)
@@ -230,7 +248,7 @@ END_READ(self) == /\ pc[self] = "END_READ"
                   /\ lock' = [lock EXCEPT !.r = TRUE]
                   /\ pc' = [pc EXCEPT ![self] = "END_READ_DECREMENT_B"]
                   /\ UNCHANGED << key_cache, which_process_fetched_key, stack, 
-                                  got_key >>
+                                  key_to_fetch, got_key >>
 
 END_READ_DECREMENT_B(self) == /\ pc[self] = "END_READ_DECREMENT_B"
                               /\ lock' = [lock EXCEPT !.b = lock.b - 1]
@@ -239,29 +257,30 @@ END_READ_DECREMENT_B(self) == /\ pc[self] = "END_READ_DECREMENT_B"
                                     ELSE /\ pc' = [pc EXCEPT ![self] = "END_READ_UNLOCK_R"]
                               /\ UNCHANGED << key_cache, 
                                               which_process_fetched_key, stack, 
-                                              got_key >>
+                                              key_to_fetch, got_key >>
 
 END_READ_UNLOCK_G(self) == /\ pc[self] = "END_READ_UNLOCK_G"
                            /\ Assert(lock.g, 
-                                     "Failure of assertion at line 56, column 17.")
+                                     "Failure of assertion at line 65, column 17.")
                            /\ lock' = [lock EXCEPT !.g = FALSE]
                            /\ pc' = [pc EXCEPT ![self] = "END_READ_UNLOCK_R"]
                            /\ UNCHANGED << key_cache, 
                                            which_process_fetched_key, stack, 
-                                           got_key >>
+                                           key_to_fetch, got_key >>
 
 END_READ_UNLOCK_R(self) == /\ pc[self] = "END_READ_UNLOCK_R"
                            /\ lock' = [lock EXCEPT !.r = FALSE]
                            /\ pc' = [pc EXCEPT ![self] = "END_READ_DONE"]
                            /\ UNCHANGED << key_cache, 
                                            which_process_fetched_key, stack, 
-                                           got_key >>
+                                           key_to_fetch, got_key >>
 
 END_READ_DONE(self) == /\ pc[self] = "END_READ_DONE"
                        /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                        /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                        /\ UNCHANGED << lock, key_cache, 
-                                       which_process_fetched_key, got_key >>
+                                       which_process_fetched_key, key_to_fetch, 
+                                       got_key >>
 
 end_read(self) == END_READ(self) \/ END_READ_DECREMENT_B(self)
                      \/ END_READ_UNLOCK_G(self) \/ END_READ_UNLOCK_R(self)
@@ -272,24 +291,25 @@ BEGIN_WRITE(self) == /\ pc[self] = "BEGIN_WRITE"
                      /\ lock' = [lock EXCEPT !.g = TRUE]
                      /\ pc' = [pc EXCEPT ![self] = "BEGIN_WRITE_DONE"]
                      /\ UNCHANGED << key_cache, which_process_fetched_key, 
-                                     stack, got_key >>
+                                     stack, key_to_fetch, got_key >>
 
 BEGIN_WRITE_DONE(self) == /\ pc[self] = "BEGIN_WRITE_DONE"
                           /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                           /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                           /\ UNCHANGED << lock, key_cache, 
-                                          which_process_fetched_key, got_key >>
+                                          which_process_fetched_key, 
+                                          key_to_fetch, got_key >>
 
 begin_write(self) == BEGIN_WRITE(self) \/ BEGIN_WRITE_DONE(self)
 
 END_WRITE(self) == /\ pc[self] = "END_WRITE"
                    /\ Assert(lock.g, 
-                             "Failure of assertion at line 75, column 9.")
+                             "Failure of assertion at line 84, column 9.")
                    /\ lock' = [lock EXCEPT !.g = FALSE]
                    /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
                    /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
                    /\ UNCHANGED << key_cache, which_process_fetched_key, 
-                                   got_key >>
+                                   key_to_fetch, got_key >>
 
 end_write(self) == END_WRITE(self)
 
@@ -299,28 +319,31 @@ GET_KEY(self) == /\ pc[self] = "GET_KEY"
                                                       \o stack[self]]
                  /\ pc' = [pc EXCEPT ![self] = "BEGIN_READ"]
                  /\ UNCHANGED << lock, key_cache, which_process_fetched_key, 
-                                 got_key >>
+                                 key_to_fetch, got_key >>
 
 GET_KEY_READ_CACHE0(self) == /\ pc[self] = "GET_KEY_READ_CACHE0"
-                             /\ IF key_cache.key0 = "pending"
+                             /\ IF key_cache[key_to_fetch[self]] = "pending"
                                    THEN /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_read",
                                                                                  pc        |->  "GET_KEY_READ_CACHE1" ] >>
                                                                              \o stack[self]]
                                         /\ pc' = [pc EXCEPT ![self] = "END_READ"]
-                                   ELSE /\ IF key_cache.key0 /= "null"
-                                              THEN /\ pc' = [pc EXCEPT ![self] = "Done"]
+                                   ELSE /\ IF key_cache[key_to_fetch[self]] /= "null"
+                                              THEN /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_read",
+                                                                                            pc        |->  "Done" ] >>
+                                                                                        \o stack[self]]
+                                                   /\ pc' = [pc EXCEPT ![self] = "END_READ"]
                                               ELSE /\ pc' = [pc EXCEPT ![self] = "GET_KEY_WRITE_PENDING0"]
-                                        /\ stack' = stack
+                                                   /\ stack' = stack
                              /\ UNCHANGED << lock, key_cache, 
                                              which_process_fetched_key, 
-                                             got_key >>
+                                             key_to_fetch, got_key >>
 
 GET_KEY_READ_CACHE1(self) == /\ pc[self] = "GET_KEY_READ_CACHE1"
-                             /\ key_cache.key0 /= "pending"
+                             /\ key_cache[key_to_fetch[self]] /= "pending"
                              /\ pc' = [pc EXCEPT ![self] = "GET_KEY"]
                              /\ UNCHANGED << lock, key_cache, 
                                              which_process_fetched_key, stack, 
-                                             got_key >>
+                                             key_to_fetch, got_key >>
 
 GET_KEY_WRITE_PENDING0(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING0"
                                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_read",
@@ -329,7 +352,7 @@ GET_KEY_WRITE_PENDING0(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING0"
                                 /\ pc' = [pc EXCEPT ![self] = "END_READ"]
                                 /\ UNCHANGED << lock, key_cache, 
                                                 which_process_fetched_key, 
-                                                got_key >>
+                                                key_to_fetch, got_key >>
 
 GET_KEY_WRITE_PENDING1(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING1"
                                 /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "begin_write",
@@ -338,10 +361,10 @@ GET_KEY_WRITE_PENDING1(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING1"
                                 /\ pc' = [pc EXCEPT ![self] = "BEGIN_WRITE"]
                                 /\ UNCHANGED << lock, key_cache, 
                                                 which_process_fetched_key, 
-                                                got_key >>
+                                                key_to_fetch, got_key >>
 
 GET_KEY_WRITE_PENDING2(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING2"
-                                /\ IF key_cache.key0 /= "null"
+                                /\ IF key_cache[key_to_fetch[self]] /= "null"
                                       THEN /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_write",
                                                                                     pc        |->  "GET_KEY" ] >>
                                                                                 \o stack[self]]
@@ -350,15 +373,16 @@ GET_KEY_WRITE_PENDING2(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING2"
                                            /\ stack' = stack
                                 /\ UNCHANGED << lock, key_cache, 
                                                 which_process_fetched_key, 
-                                                got_key >>
+                                                key_to_fetch, got_key >>
 
 GET_KEY_WRITE_PENDING3(self) == /\ pc[self] = "GET_KEY_WRITE_PENDING3"
-                                /\ key_cache' = [key_cache EXCEPT !.key0 = "pending"]
-                                /\ Assert(which_process_fetched_key.key0 = 0, 
-                                          "Failure of assertion at line 124, column 9.")
-                                /\ which_process_fetched_key' = [which_process_fetched_key EXCEPT !.key0 = self]
+                                /\ key_cache' = [key_cache EXCEPT ![key_to_fetch[self]] = "pending"]
+                                /\ Assert(which_process_fetched_key[key_to_fetch[self]] = 0, 
+                                          "Failure of assertion at line 137, column 9.")
+                                /\ which_process_fetched_key' = [which_process_fetched_key EXCEPT ![key_to_fetch[self]] = self]
                                 /\ pc' = [pc EXCEPT ![self] = "GET_KEY_WRITE_KEY0"]
-                                /\ UNCHANGED << lock, stack, got_key >>
+                                /\ UNCHANGED << lock, stack, key_to_fetch, 
+                                                got_key >>
 
 GET_KEY_WRITE_KEY0(self) == /\ pc[self] = "GET_KEY_WRITE_KEY0"
                             /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_write",
@@ -366,7 +390,8 @@ GET_KEY_WRITE_KEY0(self) == /\ pc[self] = "GET_KEY_WRITE_KEY0"
                                                                  \o stack[self]]
                             /\ pc' = [pc EXCEPT ![self] = "END_WRITE"]
                             /\ UNCHANGED << lock, key_cache, 
-                                            which_process_fetched_key, got_key >>
+                                            which_process_fetched_key, 
+                                            key_to_fetch, got_key >>
 
 GET_KEY_WRITE_KEY1(self) == /\ pc[self] = "GET_KEY_WRITE_KEY1"
                             /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "begin_write",
@@ -374,32 +399,33 @@ GET_KEY_WRITE_KEY1(self) == /\ pc[self] = "GET_KEY_WRITE_KEY1"
                                                                  \o stack[self]]
                             /\ pc' = [pc EXCEPT ![self] = "BEGIN_WRITE"]
                             /\ UNCHANGED << lock, key_cache, 
-                                            which_process_fetched_key, got_key >>
+                                            which_process_fetched_key, 
+                                            key_to_fetch, got_key >>
 
 GET_KEY_START_FETCHING(self) == /\ pc[self] = "GET_KEY_START_FETCHING"
-                                /\ Assert(key_cache.key0 = "pending", 
-                                          "Failure of assertion at line 133, column 9.")
+                                /\ Assert(key_cache[key_to_fetch[self]] = "pending", 
+                                          "Failure of assertion at line 146, column 9.")
                                 /\ \/ /\ pc' = [pc EXCEPT ![self] = "GET_KEY_SUCCEEDED"]
                                    \/ /\ pc' = [pc EXCEPT ![self] = "GET_KEY_FAILED"]
                                 /\ UNCHANGED << lock, key_cache, 
                                                 which_process_fetched_key, 
-                                                stack, got_key >>
+                                                stack, key_to_fetch, got_key >>
 
 GET_KEY_SUCCEEDED(self) == /\ pc[self] = "GET_KEY_SUCCEEDED"
-                           /\ key_cache' = [key_cache EXCEPT !.key0 = "key_material"]
+                           /\ key_cache' = [key_cache EXCEPT ![key_to_fetch[self]] = "fetched"]
                            /\ got_key' = [got_key EXCEPT ![self] = TRUE]
                            /\ pc' = [pc EXCEPT ![self] = "GET_KEY_WRITE_KEY3"]
                            /\ UNCHANGED << lock, which_process_fetched_key, 
-                                           stack >>
+                                           stack, key_to_fetch >>
 
 GET_KEY_FAILED(self) == /\ pc[self] = "GET_KEY_FAILED"
-                        /\ key_cache' = [key_cache EXCEPT !.key0 = "null"]
+                        /\ key_cache' = [key_cache EXCEPT ![key_to_fetch[self]] = "null"]
                         /\ got_key' = [got_key EXCEPT ![self] = FALSE]
-                        /\ Assert(which_process_fetched_key.key0 = self, 
-                                  "Failure of assertion at line 143, column 13.")
-                        /\ which_process_fetched_key' = [which_process_fetched_key EXCEPT !.key0 = 0]
+                        /\ Assert(which_process_fetched_key[key_to_fetch[self]] = self, 
+                                  "Failure of assertion at line 157, column 13.")
+                        /\ which_process_fetched_key' = [which_process_fetched_key EXCEPT ![key_to_fetch[self]] = 0]
                         /\ pc' = [pc EXCEPT ![self] = "GET_KEY_WRITE_KEY3"]
-                        /\ UNCHANGED << lock, stack >>
+                        /\ UNCHANGED << lock, stack, key_to_fetch >>
 
 GET_KEY_WRITE_KEY3(self) == /\ pc[self] = "GET_KEY_WRITE_KEY3"
                             /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "end_write",
@@ -407,7 +433,8 @@ GET_KEY_WRITE_KEY3(self) == /\ pc[self] = "GET_KEY_WRITE_KEY3"
                                                                  \o stack[self]]
                             /\ pc' = [pc EXCEPT ![self] = "END_WRITE"]
                             /\ UNCHANGED << lock, key_cache, 
-                                            which_process_fetched_key, got_key >>
+                                            which_process_fetched_key, 
+                                            key_to_fetch, got_key >>
 
 GET_KEY_MAYBE_RETRY(self) == /\ pc[self] = "GET_KEY_MAYBE_RETRY"
                              /\ IF ~got_key[self]
@@ -415,7 +442,7 @@ GET_KEY_MAYBE_RETRY(self) == /\ pc[self] = "GET_KEY_MAYBE_RETRY"
                                    ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
                              /\ UNCHANGED << lock, key_cache, 
                                              which_process_fetched_key, stack, 
-                                             got_key >>
+                                             key_to_fetch, got_key >>
 
 get_key(self) == GET_KEY(self) \/ GET_KEY_READ_CACHE0(self)
                     \/ GET_KEY_READ_CACHE1(self)
@@ -431,7 +458,7 @@ get_key(self) == GET_KEY(self) \/ GET_KEY_READ_CACHE0(self)
 
 Next == (\E self \in ProcSet:  \/ begin_read(self) \/ end_read(self)
                                \/ begin_write(self) \/ end_write(self))
-           \/ (\E self \in 1..2: get_key(self))
+           \/ (\E self \in 1..num_processes: get_key(self))
            \/ (* Disjunct to prevent deadlock on termination *)
               ((\A self \in ProcSet: pc[self] = "Done") /\ UNCHANGED vars)
 
@@ -454,5 +481,5 @@ FairSpec == Spec
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Mar 09 21:08:08 EST 2019 by emptysquare
+\* Last modified Sat Mar 09 23:08:27 EST 2019 by emptysquare
 \* Created Mon Feb 18 19:13:25 EST 2019 by emptysquare
