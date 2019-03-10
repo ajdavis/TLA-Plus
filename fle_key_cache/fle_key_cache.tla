@@ -477,9 +477,9 @@ of adding strong fairness guarantees to PlusCal "EITHER" expressions
 ***************************************************************************)
 
 FairSpec == Spec 
-            /\ SF_vars(\E self \in ProcSet: GET_KEY_START_FETCHING(self) /\ pc'[self] = "GET_KEY_SUCCEEDED")
+            /\ \A self \in ProcSet : SF_vars(GET_KEY_START_FETCHING(self) /\ pc'[self] = "GET_KEY_SUCCEEDED")
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Mar 09 23:08:27 EST 2019 by emptysquare
+\* Last modified Sun Mar 10 09:52:12 EDT 2019 by emptysquare
 \* Created Mon Feb 18 19:13:25 EST 2019 by emptysquare
